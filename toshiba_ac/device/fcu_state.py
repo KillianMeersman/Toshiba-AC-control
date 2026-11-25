@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 import struct
 import typing as t
 
@@ -28,6 +29,11 @@ from toshiba_ac.device.properties import (
     ToshibaAcStatus,
     ToshibaAcSwingMode,
 )
+
+
+logger = logging.getLogger(__name__)
+
+_unknown_swing_codes: t.Set[int] = set()
 
 
 class ToshibaAcFcuState:
@@ -122,7 +128,10 @@ class ToshibaAcFcuState:
     class AcSwingMode:
         @staticmethod
         def from_raw(raw: int) -> ToshibaAcSwingMode:
-            return {
+            # Units report codes missing here (seen: 0x60, and 0x84 while in
+            # 8 °C heating). Raising on them would break every state update
+            # of that unit, so they are reported as NONE instead.
+            mode = {
                 0x31: ToshibaAcSwingMode.OFF,
                 0x41: ToshibaAcSwingMode.SWING_VERTICAL,
                 0x42: ToshibaAcSwingMode.SWING_HORIZONTAL,
@@ -134,7 +143,15 @@ class ToshibaAcFcuState:
                 0x54: ToshibaAcSwingMode.FIXED_5,
                 0x00: ToshibaAcSwingMode.NONE,
                 ToshibaAcFcuState.NONE_VAL: ToshibaAcSwingMode.NONE,
-            }[raw]
+            }.get(raw)
+
+            if mode is None:
+                if raw not in _unknown_swing_codes:
+                    _unknown_swing_codes.add(raw)
+                    logger.warning(f"Unknown swing mode code 0x{raw:02x}, reporting it as NONE")
+                return ToshibaAcSwingMode.NONE
+
+            return mode
 
         @staticmethod
         def to_raw(swing_mode: ToshibaAcSwingMode) -> int:
