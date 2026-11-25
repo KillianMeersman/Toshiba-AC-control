@@ -50,7 +50,7 @@ class ToshibaAcDeviceCallback(ToshibaAcCallback["ToshibaAcDevice"]):
 
 
 class ToshibaAcDevice:
-    STATE_RELOAD_PERIOD_MINUTES = 30
+    STATE_RELOAD_PERIOD_MINUTES = 60
 
     def __init__(
         self,

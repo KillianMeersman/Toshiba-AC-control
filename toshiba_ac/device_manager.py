@@ -33,7 +33,7 @@ class ToshibaAcSasTokenUpdatedCallback(ToshibaAcCallback[str]):
 
 
 class ToshibaAcDeviceManager:
-    FETCH_ENERGY_CONSUMPTION_PERIOD_MINUTES = 10
+    FETCH_ENERGY_CONSUMPTION_PERIOD_MINUTES = 30
 
     def __init__(
         self,
