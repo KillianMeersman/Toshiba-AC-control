@@ -16,12 +16,13 @@ import datetime
 import asyncio
 import logging
 import random
+import secrets
 import typing as t
 from dataclasses import dataclass
 
 import aiohttp
 from toshiba_ac.device.properties import ToshibaAcDeviceEnergyConsumption
-from toshiba_ac.utils import RetryJitterMode, retry_on_exception
+from toshiba_ac.utils import retry_on_exception
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,12 @@ class ToshibaAcHttpApiRateLimitError(ToshibaAcHttpApiError):
 class ToshibaAcHttpApi:
     REQUEST_MIN_INTERVAL_S = 0.15
     REQUEST_JITTER_S = 0.25
+    # Toshiba's WAF answers 403 once a client IP sends too much, and keeps
+    # blocking while requests continue. Retrying only extends the block, so
+    # every request waits this long after a 403 instead.
+    BLOCKED_PAUSE_S = 600
+    # The API answers 429 "Try again in 60 seconds" when login is throttled.
+    RATE_LIMITED_PAUSE_S = 60
     BASE_URL = "https://mobileapi.toshibahomeaccontrols.com"
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -82,6 +89,9 @@ class ToshibaAcHttpApi:
         self._auth_generation = 0
         self._request_pacing_lock = asyncio.Lock()
         self._next_request_not_before = 0.0
+        self._paused_until = 0.0
+        # Toshiba's WAF has required a Device-ID header since ~2026-07-17.
+        self.device_id_header = secrets.token_hex(8)
 
     async def _pace_requests(self) -> None:
         async with self._request_pacing_lock:
@@ -96,11 +106,30 @@ class ToshibaAcHttpApi:
                 loop.time() + self.REQUEST_MIN_INTERVAL_S + random.uniform(0.0, self.REQUEST_JITTER_S)
             )
 
+    def _pause(self, seconds: float, reason: str) -> None:
+        until = asyncio.get_running_loop().time() + seconds
+
+        if until > self._paused_until:
+            logger.warning(f"{reason}, pausing all Toshiba API requests for {seconds:.0f}s")
+            self._paused_until = until
+
+    async def _wait_while_paused(self) -> None:
+        while True:
+            remaining = self._paused_until - asyncio.get_running_loop().time()
+
+            if remaining <= 0:
+                return
+
+            await asyncio.sleep(remaining)
+
     async def _ensure_session(self) -> None:
         async with self._session_lock:
             if not self.session or self.session.closed:
                 timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=15)
-                self.session = aiohttp.ClientSession(timeout=timeout)
+                self.session = aiohttp.ClientSession(
+                    timeout=timeout,
+                    headers={"Device-ID": self.device_id_header},
+                )
 
     async def _refresh_auth_if_stale(self, failed_auth_generation: int) -> None:
         async with self._auth_lock:
@@ -109,14 +138,6 @@ class ToshibaAcHttpApi:
 
             await self.connect()
 
-    @retry_on_exception(
-        exceptions=ToshibaAcHttpApiRateLimitError,
-        retries=5,
-        backoff=10,
-        max_backoff=600,
-        growth_factor=3,
-        jitter_mode=RetryJitterMode.EQUAL,
-    )
     @retry_on_exception(
         exceptions=(ToshibaAcHttpApiError, aiohttp.ClientError, asyncio.TimeoutError),
         retries=2,
@@ -156,6 +177,7 @@ class ToshibaAcHttpApi:
         if not self.session:
             raise ToshibaAcHttpApiError("Failed to initialize HTTP session")
 
+        await self._wait_while_paused()
         await self._pace_requests()
 
         method_args = {"params": get, "headers": headers}
@@ -210,7 +232,12 @@ class ToshibaAcHttpApi:
                 raise ToshibaAcHttpApiAuthError(f"HTTP 401 calling {path}")
 
             if response.status == 403:
+                self._pause(self.BLOCKED_PAUSE_S, f"HTTP 403 from Toshiba's firewall calling {path}")
                 raise ToshibaAcHttpApiRateLimitError(f"HTTP 403 calling {path}")
+
+            if response.status == 429:
+                self._pause(self.RATE_LIMITED_PAUSE_S, f"HTTP 429 (too many requests) calling {path}")
+                raise ToshibaAcHttpApiRateLimitError(f"HTTP 429 calling {path}")
 
             raise ToshibaAcHttpApiError(f"HTTP {response.status} calling {path}")
 
