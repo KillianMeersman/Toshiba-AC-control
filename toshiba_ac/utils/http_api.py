@@ -90,6 +90,7 @@ class ToshibaAcHttpApi:
         self._request_pacing_lock = asyncio.Lock()
         self._next_request_not_before = 0.0
         self._paused_until = 0.0
+        self._request_lock = asyncio.Lock()
         # Toshiba's WAF has required a Device-ID header since ~2026-07-17.
         self.device_id_header = secrets.token_hex(8)
 
@@ -177,69 +178,72 @@ class ToshibaAcHttpApi:
         if not self.session:
             raise ToshibaAcHttpApiError("Failed to initialize HTTP session")
 
-        await self._wait_while_paused()
-        await self._pace_requests()
+        # One request in flight at a time: a request queued behind one that is
+        # about to get a 403 must see the resulting pause before it is sent.
+        async with self._request_lock:
+            await self._wait_while_paused()
+            await self._pace_requests()
 
-        method_args = {"params": get, "headers": headers}
+            method_args = {"params": get, "headers": headers}
 
-        if post:
-            logger.debug(f"Sending POST to {url}")
-            method_args["json"] = post
-            method = self.session.post
-        else:
-            logger.debug(f"Sending GET to {url}")
-            method = self.session.get
+            if post:
+                logger.debug(f"Sending POST to {url}")
+                method_args["json"] = post
+                method = self.session.post
+            else:
+                logger.debug(f"Sending GET to {url}")
+                method = self.session.get
 
-        async with method(url, **method_args) as response:
-            logger.debug(f"Response code: {response.status}")
+            async with method(url, **method_args) as response:
+                logger.debug(f"Response code: {response.status}")
 
-            if response.status == 200:
-                try:
-                    json = await response.json()
-                except (aiohttp.ContentTypeError, ValueError) as e:
-                    raise ToshibaAcHttpApiError(f"Malformed JSON response for {path}: {e}") from e
+                if response.status == 200:
+                    try:
+                        json = await response.json()
+                    except (aiohttp.ContentTypeError, ValueError) as e:
+                        raise ToshibaAcHttpApiError(f"Malformed JSON response for {path}: {e}") from e
 
-                if json["IsSuccess"]:
-                    return json["ResObj"]
-                else:
-                    if json["StatusCode"] == "InvalidUserNameorPassword":
-                        raise ToshibaAcHttpApiAuthError(json["Message"])
+                    if json["IsSuccess"]:
+                        return json["ResObj"]
+                    else:
+                        if json["StatusCode"] == "InvalidUserNameorPassword":
+                            raise ToshibaAcHttpApiAuthError(json["Message"])
 
-                    raise ToshibaAcHttpApiError(json["Message"])
+                        raise ToshibaAcHttpApiError(json["Message"])
 
-            response_text = await response.text()
-            logger.warning(
-                "Non-200 response from Toshiba API "
-                f"(status={response.status}, path={path}, content_type={response.headers.get('Content-Type')}, "
-                f"server={response.headers.get('Server')})"
+                response_text = await response.text()
+                logger.warning(
+                    "Non-200 response from Toshiba API "
+                    f"(status={response.status}, path={path}, content_type={response.headers.get('Content-Type')}, "
+                    f"server={response.headers.get('Server')})"
+                )
+                logger.debug(f"Non-200 response body for {path} (first 500 chars): {response_text[:500]}")
+
+                if response.status == 403:
+                    self._pause(self.BLOCKED_PAUSE_S, f"HTTP 403 from Toshiba's firewall calling {path}")
+                    raise ToshibaAcHttpApiRateLimitError(f"HTTP 403 calling {path}")
+
+                if response.status == 429:
+                    self._pause(self.RATE_LIMITED_PAUSE_S, f"HTTP 429 (too many requests) calling {path}")
+                    raise ToshibaAcHttpApiRateLimitError(f"HTTP 429 calling {path}")
+
+                if not (is_authenticated_request and response.status == 401):
+                    raise ToshibaAcHttpApiError(f"HTTP {response.status} calling {path}")
+
+        # 401 on an authenticated request. Re-login sends requests of its own,
+        # so it has to happen outside the request lock.
+        if reauth_on_auth_error:
+            logger.warning(f"Auth failed for endpoint {path} with status 401. " f"Refreshing auth and retrying once.")
+            await self._refresh_auth_if_stale(auth_generation)
+            return await self.request_api(
+                path,
+                get=get,
+                post=post,
+                headers=None,
+                reauth_on_auth_error=False,
             )
-            logger.debug(f"Non-200 response body for {path} (first 500 chars): {response_text[:500]}")
 
-            if is_authenticated_request and response.status == 401:
-                if reauth_on_auth_error:
-                    logger.warning(
-                        f"Auth failed for endpoint {path} with status 401. " f"Refreshing auth and retrying once."
-                    )
-                    await self._refresh_auth_if_stale(auth_generation)
-                    return await self.request_api(
-                        path,
-                        get=get,
-                        post=post,
-                        headers=None,
-                        reauth_on_auth_error=False,
-                    )
-
-                raise ToshibaAcHttpApiAuthError(f"HTTP 401 calling {path}")
-
-            if response.status == 403:
-                self._pause(self.BLOCKED_PAUSE_S, f"HTTP 403 from Toshiba's firewall calling {path}")
-                raise ToshibaAcHttpApiRateLimitError(f"HTTP 403 calling {path}")
-
-            if response.status == 429:
-                self._pause(self.RATE_LIMITED_PAUSE_S, f"HTTP 429 (too many requests) calling {path}")
-                raise ToshibaAcHttpApiRateLimitError(f"HTTP 429 calling {path}")
-
-            raise ToshibaAcHttpApiError(f"HTTP {response.status} calling {path}")
+        raise ToshibaAcHttpApiAuthError(f"HTTP 401 calling {path}")
 
     async def connect(self) -> None:
         headers = {
